@@ -47,12 +47,19 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
         shell: bash
         run: |
+          notes="release-notes/$TAG.md"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "$TAG already exists; nothing to publish."
+            if [[ -f "$notes" ]]; then
+              gh release edit "$TAG" \
+                --title "ascii-dlp $TAG" \
+                --notes-file "$notes"
+              echo "$TAG release notes updated."
+            else
+              echo "$TAG already exists and no release notes file was found."
+            fi
             exit 0
           fi
 
-          notes="release-notes/$TAG.md"
           if [[ -f "$notes" ]]; then
             gh release create "$TAG" dist/* \
               --target "$GITHUB_SHA" \
