@@ -112,7 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     source_group.add_argument(
         "--ffmpeg-location",
-        help="ffmpeg/ffprobe/ffplayがあるフォルダー、またはffmpeg実行ファイル",
+        help="外部ffmpeg/ffprobeがあるフォルダー、またはffmpeg実行ファイル",
     )
 
     display = parser.add_argument_group("表示")
@@ -186,6 +186,16 @@ def _doctor(ffmpeg_location: str | None) -> int:
         okay = False
 
     try:
+        import miniaudio
+
+        version = getattr(miniaudio, "__version__", "unknown")
+        library_version = miniaudio.lib_version()
+        print(f"miniaudio: {version} (library {library_version})")
+    except (ImportError, OSError, RuntimeError) as exc:
+        print(f"miniaudio: NOT READY ({exc})")
+        okay = False
+
+    try:
         tools = Toolchain.discover(ffmpeg_location)
     except AsciiDlpError as exc:
         print(f"FFmpeg: NOT READY ({exc})")
@@ -193,12 +203,11 @@ def _doctor(ffmpeg_location: str | None) -> int:
     for name, version in tools.versions().items():
         if version:
             display = version
-        elif name == "ffplay":
-            display = "NOT FOUND (音声なしで再生可能)"
         else:
             display = "NOT FOUND"
             okay = False
         print(f"{name}: {display}")
+    print(f"FFmpeg source: {'bundled' if tools.bundled else 'external'}")
     print(f"stdin TTY: {'yes' if sys.stdin.isatty() else 'no'}")
     print(f"stdout TTY: {'yes' if sys.stdout.isatty() else 'no'}")
     return 0 if okay else 1
@@ -233,16 +242,6 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
     remote_info = args.info and not Path(args.source).expanduser().is_file()
     toolchain = None if remote_info else Toolchain.discover(args.ffmpeg_location)
-    if (
-        not args.info
-        and not args.no_audio
-        and toolchain is not None
-        and not toolchain.ffplay
-    ):
-        print(
-            "警告: ffplayが見つからないため、音声なしで再生します。",
-            file=sys.stderr,
-        )
 
     progress = _Progress()
     resolved = None
@@ -282,7 +281,7 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             gamma=args.gamma,
             contrast=args.contrast,
             start=args.start,
-            audio=not args.no_audio and bool(toolchain.ffplay),
+            audio=not args.no_audio,
             volume=args.volume,
             seek_step=args.seek_step,
             long_seek_step=args.long_seek_step,

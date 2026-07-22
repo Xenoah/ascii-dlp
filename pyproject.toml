@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ascii-dlp"
-version = "1.0.0"
+version = "1.1.0"
 description = "Watch videos as ASCII art in your terminal, powered by yt-dlp and FFmpeg"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,7 +23,11 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Topic :: Multimedia :: Video :: Display",
 ]
-dependencies = ["yt-dlp>=2025.1.15"]
+dependencies = [
+  "ffmpeg-binaries-compat==1.1.0",
+  "miniaudio==1.71",
+  "yt-dlp>=2025.1.15",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.9"]

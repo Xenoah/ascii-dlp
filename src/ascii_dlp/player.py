@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Generator
 from dataclasses import dataclass
 from enum import Enum
 from typing import BinaryIO
@@ -46,6 +47,21 @@ def _read_exact(stream: BinaryIO, size: int) -> bytes | None:
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
+
+
+def _pcm_stream(
+    source: BinaryIO,
+    *,
+    channels: int = 2,
+    sample_width: int = 2,
+) -> Generator[bytes, int, None]:
+    required_frames = yield b""
+    bytes_per_frame = channels * sample_width
+    while True:
+        sample_data = source.read(required_frames * bytes_per_frame)
+        if not sample_data:
+            return
+        required_frames = yield sample_data
 
 
 def _error_from_file(stream: BinaryIO, redacted: str) -> str | None:
@@ -179,15 +195,20 @@ class AudioPipeline:
         volume: int,
     ) -> None:
         self._decoder: subprocess.Popen[bytes] | None = None
-        self._player: subprocess.Popen[bytes] | None = None
+        self._device = None
+        self._stream: Generator[bytes, int, None] | None = None
         self._location = source.location
         self._decoder_stderr: BinaryIO | None = None
-        self._player_stderr: BinaryIO | None = None
-        if toolchain.ffplay is None:
-            return
+
+        try:
+            import miniaudio
+        except (ImportError, OSError) as exc:
+            raise AsciiDlpError(
+                "音声ライブラリを読み込めませんでした。"
+                "ascii-dlpを再インストールしてください。"
+            ) from exc
 
         self._decoder_stderr = tempfile.TemporaryFile()
-        self._player_stderr = tempfile.TemporaryFile()
 
         decoder_command = [
             toolchain.ffmpeg,
@@ -205,6 +226,8 @@ class AudioPipeline:
             "-vn",
             "-sn",
             "-dn",
+            "-af",
+            f"volume={volume / 100:.4f}",
             "-ac",
             "2",
             "-ar",
@@ -214,25 +237,6 @@ class AudioPipeline:
             "-f",
             "s16le",
             "pipe:1",
-        ]
-        player_command = [
-            toolchain.ffplay,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostats",
-            "-nodisp",
-            "-autoexit",
-            "-f",
-            "s16le",
-            "-ar",
-            "48000",
-            "-ac",
-            "2",
-            "-volume",
-            str(volume),
-            "-i",
-            "pipe:0",
         ]
         try:
             self._decoder = subprocess.Popen(
@@ -244,47 +248,58 @@ class AudioPipeline:
             )
         except OSError as exc:
             self._decoder_stderr.close()
-            self._player_stderr.close()
+            self._decoder_stderr = None
             raise AsciiDlpError(f"音声用FFmpegを起動できませんでした: {exc}") from exc
+
         assert self._decoder.stdout is not None
         try:
-            self._player = subprocess.Popen(
-                player_command,
-                stdin=self._decoder.stdout,
-                stdout=subprocess.DEVNULL,
-                stderr=self._player_stderr,
-                creationflags=_creation_flags(),
+            self._device = miniaudio.PlaybackDevice(
+                output_format=miniaudio.SampleFormat.SIGNED16,
+                nchannels=2,
+                sample_rate=48000,
+                buffersize_msec=20,
+                app_name="ascii-dlp",
             )
-        except OSError as exc:
-            self._decoder.stdout.close()
-            _stop_process(self._decoder)
-            self._decoder_stderr.close()
-            self._player_stderr.close()
-            raise AsciiDlpError(f"ffplayを起動できませんでした: {exc}") from exc
-        else:
-            self._decoder.stdout.close()
+            self._stream = _pcm_stream(self._decoder.stdout)
+            next(self._stream)
+            self._device.start(self._stream)
+        except Exception as exc:
+            self.stop()
+            raise AsciiDlpError(f"音声デバイスを開始できませんでした: {exc}") from exc
 
     def failure_detail(self) -> str | None:
-        pairs = (
-            (self._player, self._player_stderr, "ffplay"),
-            (self._decoder, self._decoder_stderr, "audio FFmpeg"),
-        )
-        for process, error_file, label in pairs:
-            if process is None or error_file is None:
-                continue
-            returncode = process.poll()
-            if returncode not in (None, 0):
-                detail = _error_from_file(error_file, self._location)
-                return f"{label}: {detail or f'exit {returncode}'}"
+        if self._decoder is None or self._decoder_stderr is None:
+            return None
+        returncode = self._decoder.poll()
+        if returncode not in (None, 0):
+            detail = _error_from_file(self._decoder_stderr, self._location)
+            return f"audio FFmpeg: {detail or f'exit {returncode}'}"
         return None
 
     def stop(self) -> None:
-        _stop_process(self._player)
-        _stop_process(self._decoder)
-        if self._player_stderr is not None:
-            self._player_stderr.close()
-        if self._decoder_stderr is not None:
-            self._decoder_stderr.close()
+        decoder = self._decoder
+        self._decoder = None
+        _stop_process(decoder)
+
+        device = self._device
+        self._device = None
+        if device is not None:
+            try:
+                device.close()
+            except Exception:
+                pass
+
+        stream = self._stream
+        self._stream = None
+        if stream is not None:
+            stream.close()
+        if decoder is not None and decoder.stdout is not None:
+            decoder.stdout.close()
+
+        decoder_stderr = self._decoder_stderr
+        self._decoder_stderr = None
+        if decoder_stderr is not None:
+            decoder_stderr.close()
 
 
 @dataclass(frozen=True)
@@ -472,18 +487,23 @@ def play(source: ResolvedSource, toolchain: Toolchain, config: PlayerConfig) -> 
                     footer=audio_notice or controls_footer,
                 )
 
-                if (
-                    config.audio
-                    and source.media.has_audio
-                    and toolchain.ffplay
-                    and not audio_disabled
-                ):
-                    audio = AudioPipeline(
-                        source,
-                        toolchain,
-                        position=position,
-                        volume=config.volume,
-                    )
+                if config.audio and source.media.has_audio and not audio_disabled:
+                    try:
+                        audio = AudioPipeline(
+                            source,
+                            toolchain,
+                            position=position,
+                            volume=config.volume,
+                        )
+                    except AsciiDlpError as exc:
+                        audio_disabled = True
+                        audio_notice = f"Q:終了 | AUDIO OFF: {_safe_title(str(exc))}"
+                        screen.render(
+                            last_lines,
+                            _status(source, position, dimensions, fps),
+                            paused=False,
+                            footer=audio_notice,
+                        )
                 anchor_position = position
                 latency = config.audio_latency_ms / 1000.0 if audio else 0.0
                 anchor_clock = time.monotonic() + latency
